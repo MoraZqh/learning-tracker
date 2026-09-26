@@ -6,7 +6,7 @@
 <meta name="theme-color" content="#7c5cff">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <title>学习目标管理台</title>
-<!-- 单文件工作台：无外部依赖，数据存 localStorage，断网可用 -->
+<!-- 单文件工作台 v2：无外部依赖；数据即时存 localStorage（断网可用），登录 Supabase 后云端同步多设备 -->
 <style>
 :root{
   --bg:#f6f7fb; --card:#ffffff; --ink:#1f2430; --muted:#6b7280; --line:#e7e9f0;
@@ -158,6 +158,10 @@ table.wt th:first-child{background:#fafbfe}
 #backupBanner{position:sticky;top:0;z-index:50;background:#fdf6e8;border-bottom:1px solid #f3e0b3;color:#7c5a10;padding:10px 16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:13px}
 #backupBanner .btn{min-height:32px;padding:0 12px;font-size:13px;border-radius:9px}
 
+/* 同步状态徽章 */
+#syncBadge{position:fixed;top:12px;right:14px;z-index:60;font-size:12px;padding:4px 12px;border-radius:99px;font-weight:600;box-shadow:var(--shadow);display:inline-flex;align-items:center;gap:4px;background:#fff}
+@media (max-width:767px){#syncBadge{top:10px;right:10px}}
+
 /* Toast */
 #toast{position:fixed;left:50%;bottom:96px;transform:translateX(-50%);background:rgba(31,36,48,.92);color:#fff;padding:10px 18px;border-radius:12px;font-size:14px;z-index:200;opacity:0;pointer-events:none;transition:opacity .25s;max-width:86vw;text-align:center}
 #toast.show{opacity:1}
@@ -172,6 +176,7 @@ table.wt th:first-child{background:#fafbfe}
 <body>
 
 <div id="backupBanner" class="hidden"></div>
+<div id="syncBadge" class="hidden"></div>
 
 <div id="app">
   <aside id="sidebar">
@@ -209,15 +214,19 @@ var LS_KEYS={goals:'wb_lgoal_goals',logs:'wb_lgoal_logs',notes:'wb_lgoal_weeknot
 var LEGACY_GOALS=['wb_learning_goals','wb_goals_v1'];
 var LEGACY_LOGS=['wb_learning_logs','wb_logs_v1'];
 var COLORS={purple:'#7c5cff',green:'#16a34a',amber:'#d97706',blue:'#2563eb'};
+/* 云同步配置：Supabase anon key 设计上可公开，数据安全由 RLS（只能读写本人数据）保证 */
+var SB={url:'https://eplpxfenqwcdaosbnpde.supabase.co',key:'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVwbHB4ZmVucXdjZGFvc2JucGRlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODkzNjcyNTIsImV4cCI6MjEwNDk0MzI1Mn0.04JZwJ7oTmGNpS8Tjl2pywTjodljFyKotjodYq0kimE'};
+var SESSION_KEY='wb_lgoal_sb_session';
+var session=null,syncing=false,syncTimer=null,muteSync=false;
 
 var goals=[],logs=[],weekNotes={},meta={};
 var currentPage='today',weekOffset=0,pendingConfirm=null,editedGoalId=null,formColor='purple',lastReport='';
 
 function readLS(k,d){try{var v=localStorage.getItem(k);return v===null?d:JSON.parse(v);}catch(e){return d;}}
 function writeLS(k,v){try{localStorage.setItem(k,JSON.stringify(v));}catch(e){}}
-function saveGoals(){writeLS(LS_KEYS.goals,goals);}
-function saveLogs(){writeLS(LS_KEYS.logs,logs);}
-function saveNotes(){writeLS(LS_KEYS.notes,weekNotes);}
+function saveGoals(){writeLS(LS_KEYS.goals,goals);scheduleSync();}
+function saveLogs(){writeLS(LS_KEYS.logs,logs);scheduleSync();}
+function saveNotes(){writeLS(LS_KEYS.notes,weekNotes);scheduleSync();}
 function saveMeta(){writeLS(LS_KEYS.meta,meta);}
 
 function uid(){return Date.now().toString(36)+Math.random().toString(36).slice(2,7);}
@@ -226,7 +235,8 @@ function loadAll(){
   goals=readLS(LS_KEYS.goals,null);
   logs=readLS(LS_KEYS.logs,null);
   weekNotes=readLS(LS_KEYS.notes,{});
-  meta=readLS(LS_KEYS.meta,{exampleCleared:false,backupDismissed:false,migrated:false});
+  meta=readLS(LS_KEYS.meta,{exampleCleared:false,backupDismissed:false,migrated:false,pendingDeletes:[]});
+  if(!meta.pendingDeletes)meta.pendingDeletes=[];
   if(goals===null){
     var migrated=migrateLegacy();
     if(!migrated){seedExamples();}
@@ -278,6 +288,167 @@ function seedExamples(){
     {id:uid(),goalId:g3.id,date:addDays(t,-1),amount:1,minutes:30,isBackfill:false,example:true,createdAt:new Date().toISOString()}
   ];
   saveGoals();saveLogs();
+}
+
+/* =========================================================
+ * 云同步层（Supabase，纯 XHR 直连，不引外部 SDK）
+ * 策略：本地永远即时保存（离线可用）；登录后拉取合并 + 推送；
+ *       目标/周复盘按 updatedAt 新者胜；打卡按 id 并集；删除即时下发。
+ * =======================================================*/
+function sbSave(){if(session)localStorage.setItem(SESSION_KEY,JSON.stringify(session));else localStorage.removeItem(SESSION_KEY);}
+
+function setSync(state){
+  var el=document.getElementById('syncBadge');if(!el)return;
+  var map={ok:['chip-green','check','已同步'],syncing:['chip-amber','refresh','同步中…'],
+    err:['chip-red','alert','同步失败'],off:['chip-gray','clock','仅本机 · 未登录']};
+  var m=map[state]||map.off;
+  el.className=m[0];
+  el.innerHTML=ic(m[1],12)+' '+m[2];
+  el.title=(state==='err'?'请在「我的」页查看原因，或点「立即同步」重试':(meta.lastSync?'上次同步：'+meta.lastSync.slice(0,19).replace('T',' '):''));
+}
+
+function sbReq(method,path,body,opts){
+  opts=opts||{};
+  return new Promise(function(resolve,reject){
+    var data=body!=null?JSON.stringify(body):null;
+    var x=new XMLHttpRequest();
+    x.open(method,SB.url+path,true);
+    x.setRequestHeader('apikey',SB.key);
+    if(data)x.setRequestHeader('Content-Type','application/json');
+    if(opts.prefer)x.setRequestHeader('Prefer',opts.prefer);
+    if(opts.auth!==false&&session)x.setRequestHeader('Authorization','Bearer '+session.access_token);
+    x.onload=function(){
+      var txt=x.responseText||'';var j=null;try{j=txt?JSON.parse(txt):null;}catch(e){}
+      if(x.status>=200&&x.status<300)resolve(j);
+      else{
+        var code=j&&j.code?String(j.code):'';
+        var msg=(j&&(j.msg||j.message||j.error_description))||('HTTP '+x.status);
+        if(code==='42703'||code==='PGRST204')msg='云端表结构未就绪，请先在 Supabase SQL Editor 执行 supabase_schema.sql';
+        reject({status:x.status,code:code,msg:msg});
+      }
+    };
+    x.onerror=function(){reject({status:0,code:'',msg:'网络不可达，暂以离线模式运行，数据已保存在本机'});};
+    x.send(data);
+  });
+}
+
+/* 会话续期：提前 2 分钟刷新 token */
+function ensureSession(){
+  if(!session)return Promise.resolve(null);
+  var now=Math.floor(Date.now()/1000);
+  if(session.expires_at&&session.expires_at-now<120){
+    return sbReq('POST','/auth/v1/token?grant_type=refresh_token',{refresh_token:session.refresh_token},{auth:false})
+      .then(function(j){
+        session={access_token:j.access_token,refresh_token:j.refresh_token||session.refresh_token,
+          expires_at:Math.floor(Date.now()/1000)+(j.expires_in||3600),user:j.user||session.user};
+        sbSave();return session;
+      })
+      .catch(function(e){
+        if(e.status===400||e.status===401){session=null;sbSave();}
+        throw e;
+      });
+  }
+  return Promise.resolve(session);
+}
+
+/* 本地数据 → 云端行映射 */
+function goalToRow(g){return{id:g.id,user_id:session.user.id,name:g.name,unit:g.unit,
+  total:String(g.total),deadline:g.deadline,color:g.color,
+  obstacle:g.obstacle||'',strategy:g.strategy||'',
+  example:g.example?'1':'0',created_at:(g.createdAt||todayStr())+'T00:00:00Z',
+  updated_at:g.updatedAt||new Date().toISOString()};}
+function logToRow(l){return{id:l.id,user_id:session.user.id,goal_id:l.goalId,date:l.date,
+  amount:String(l.amount),minutes:String(l.minutes||0),
+  is_backfill:l.isBackfill?'1':'0',example:l.example?'1':'0',
+  created_at:l.createdAt||new Date().toISOString()};}
+function noteId(mon){return 'wk-'+mon+'-'+session.user.id.slice(0,8);}
+function noteToRow(mon){var n=weekNotes[mon];return{id:noteId(mon),user_id:session.user.id,
+  week_mon:mon,keep:n.keep||'',problem:n.problem||'',try_txt:n.tryTxt||'',plan:n.plan||'',
+  updated_at:n.updatedAt||new Date().toISOString()};}
+
+function pushAll(){
+  if(!session)return Promise.resolve();
+  var jobs=[];
+  var dels=meta.pendingDeletes||[];
+  var logIds=dels.filter(function(d){return d.t==='log';}).map(function(d){return d.id;});
+  var goalIds=dels.filter(function(d){return d.t==='goal';}).map(function(d){return d.id;});
+  if(logIds.length)jobs.push(sbReq('DELETE','/rest/v1/lg_logs?id=in.('+encodeURIComponent(logIds.join(','))+')',null).catch(function(){}));
+  if(goalIds.length)jobs.push(sbReq('DELETE','/rest/v1/lg_goals?id=in.('+encodeURIComponent(goalIds.join(','))+')',null).catch(function(){}));
+  if(goals.length)jobs.push(sbReq('POST','/rest/v1/lg_goals?on_conflict=id',goals.map(goalToRow),{prefer:'resolution=merge-duplicates'}));
+  if(logs.length)jobs.push(sbReq('POST','/rest/v1/lg_logs?on_conflict=id',logs.map(logToRow),{prefer:'resolution=merge-duplicates'}));
+  var mons=Object.keys(weekNotes);
+  if(mons.length)jobs.push(sbReq('POST','/rest/v1/lg_notes?on_conflict=id',mons.map(noteToRow),{prefer:'resolution=merge-duplicates'}));
+  return Promise.all(jobs).then(function(){
+    if(dels.length){meta.pendingDeletes=[];saveMeta();}
+  });
+}
+
+function pullMerge(){
+  return Promise.all([
+    sbReq('GET','/rest/v1/lg_goals?select=*'),
+    sbReq('GET','/rest/v1/lg_logs?select=*'),
+    sbReq('GET','/rest/v1/lg_notes?select=*')
+  ]).then(function(res){
+    var changed=false,i,k;
+    (res[0]||[]).forEach(function(r){
+      var local=null;
+      for(i=0;i<goals.length;i++)if(goals[i].id===r.id){local=goals[i];break;}
+      var cloud={id:r.id,name:r.name||'未命名',unit:r.unit||'个',total:+r.total||0,
+        deadline:r.deadline||addDays(todayStr(),90),
+        color:COLORS[r.color]?r.color:'purple',obstacle:r.obstacle||'',strategy:r.strategy||'',
+        example:r.example==='1',createdAt:(r.created_at||'').slice(0,10)||todayStr(),
+        updatedAt:r.updated_at||''};
+      if(!local){goals.push(cloud);changed=true;}
+      else if((cloud.updatedAt||'')>(local.updatedAt||'')){for(k in cloud)local[k]=cloud[k];changed=true;}
+    });
+    (res[1]||[]).forEach(function(r){
+      var exists=false;
+      for(i=0;i<logs.length;i++)if(logs[i].id===r.id){exists=true;break;}
+      if(!exists){logs.push({id:r.id,goalId:r.goal_id,date:r.date,amount:+r.amount||0,
+        minutes:+r.minutes||0,isBackfill:r.is_backfill==='1',example:r.example==='1',
+        createdAt:r.created_at||new Date().toISOString()});changed=true;}
+    });
+    (res[2]||[]).forEach(function(r){
+      var mon=r.week_mon;if(!mon)return;
+      var local=weekNotes[mon];
+      if(!local||((r.updated_at||'')>(local.updatedAt||''))){
+        weekNotes[mon]={keep:r.keep||'',problem:r.problem||'',tryTxt:r.try_txt||'',plan:r.plan||'',updatedAt:r.updated_at||''};
+        changed=true;
+      }
+    });
+    if(changed){muteSync=true;saveGoals();saveLogs();saveNotes();muteSync=false;}
+    return changed;
+  });
+}
+
+function fullSync(manual){
+  if(!SB.url||syncing)return;
+  if(!session){setSync('off');return;}
+  syncing=true;setSync('syncing');
+  var sig0=JSON.stringify([goals,logs,weekNotes]);
+  ensureSession()
+    .then(function(){return pullMerge();})
+    .then(function(changed){return pushAll().then(function(){return changed;});})
+    .then(function(changed){
+      syncing=false;meta.lastSync=new Date().toISOString();saveMeta();
+      var sig1=JSON.stringify([goals,logs,weekNotes]);
+      setSync('ok');
+      if(changed||sig1!==sig0||manual)refreshAll();
+    })
+    .catch(function(e){
+      syncing=false;setSync('err');
+      if(manual)toast(e.msg||'同步失败');
+      if(e.status===404||(e.status===400&&/relation|PGRST/.test(e.msg||'')))
+        toast('云端数据表未创建：请在 Supabase SQL Editor 执行 supabase_schema.sql');
+    });
+}
+
+function scheduleSync(){
+  if(muteSync||syncing)return;
+  if(!session){setSync('off');return;}
+  setSync('syncing');
+  clearTimeout(syncTimer);
+  syncTimer=setTimeout(function(){fullSync(false);},2500);
 }
 
 /* =========================================================
@@ -680,6 +851,27 @@ function cmp(label,cur,prev,unit){
 function renderMine(){
   var el=document.getElementById('page-mine');
   var h='<div class="page-head"><h1>我的</h1></div>';
+
+  /* 云同步 */
+  h+='<div class="card"><div style="font-weight:700;margin-bottom:8px">'+ic('refresh',16)+' 云同步（Supabase）</div>';
+  if(!SB.url){
+    h+='<div class="sub">未配置云端，当前为纯本机模式。</div>';
+  }else if(!session){
+    h+='<div class="sub" style="margin-bottom:10px">登录后数据自动云端同步，多设备互通；断网时自动保存在本机，恢复后自动补传。</div>'
+      +'<div class="f-row"><div class="f-item"><input id="sbEmail" type="email" placeholder="邮箱" autocomplete="email"></div>'
+      +'<div class="f-item"><input id="sbPass" type="password" placeholder="密码（至少 6 位）" autocomplete="current-password"></div></div>'
+      +'<div style="display:flex;gap:10px;margin-top:8px;flex-wrap:wrap">'
+      +'<button class="btn btn-primary btn-sm" data-act="sb-login">'+ic('check',14)+' 登录</button>'
+      +'<button class="btn btn-sm" data-act="sb-signup">'+ic('plus',14)+' 注册新账号</button></div>'
+      +'<div class="hint">与「生活集」共用同一个 Supabase 项目；数据按账号隔离（RLS），只有你自己能读写自己的记录。</div>';
+  }else{
+    h+='<div class="mine-row"><div class="mr-main"><div class="mr-title">'+ic('check',14)+' 已登录：'+esc(session.user&&session.user.email||'')+'</div>'
+      +'<div class="mr-desc">'+(meta.lastSync?'上次同步：'+esc(meta.lastSync.slice(0,19).replace('T',' ')):'尚未同步，点「立即同步」试试')+'</div></div>'
+      +'<button class="btn btn-sm" data-act="sb-sync">'+ic('refresh',14)+' 立即同步</button>'
+      +'<button class="btn btn-sm btn-danger" data-act="sb-logout">退出登录</button></div>';
+  }
+  h+='</div>';
+
   h+='<div class="card"><div class="sub" style="margin-bottom:6px">当前数据：'+goals.length+' 个目标 · '+logs.length+' 条打卡 · '+Object.keys(weekNotes).length+' 份周复盘</div>'
     +(meta.migrated?'<div class="chip chip-green" style="margin-top:4px">已自动迁移旧版本数据</div>':'')
     +'</div>';
@@ -701,7 +893,7 @@ function renderMine(){
     +'<li>用 Chrome 打开本页面</li><li>点右上角「⋮」菜单</li><li>选择「添加到主屏幕」</li></ol></div>'
     +'<div class="hint">添加后可像 APP 一样全屏打开使用。</div></div>';
 
-  h+='<div class="card"><div class="sub">学习目标管理台 v1.0 · 单文件 HTML · 数据仅保存在本机浏览器 localStorage，不上传任何服务器，断网可用。换设备请用「导出 / 导入」迁移。</div></div>';
+  h+='<div class="card"><div class="sub">学习目标管理台 v2.0（云同步版） · 单文件 HTML · 数据即时存本机 localStorage，登录后自动同步 Supabase 云端（多设备互通），断网自动降级本机模式。换设备：登录同一账号即可，也可用「导出 / 导入」迁移。</div></div>';
   el.innerHTML=h;
 }
 
@@ -711,6 +903,7 @@ function renderMine(){
 function refreshAll(){
   renderNav();
   renderBackupBanner();
+  if(!syncing)setSync(session&&meta.lastSync?'ok':'off');
   renderToday();
   renderBoard();
   renderWeekly();
@@ -873,6 +1066,9 @@ document.addEventListener('click',function(e){
   if(act==='del-goal'){
     var g=goals.find(function(x){return x.id===gid;});if(!g)return;
     confirmModal('删除目标「'+g.name+'」？','将同时删除该目标的 '+goalLogs(g.id).length+' 条打卡记录，不可恢复。','确认删除',true,function(){
+      meta.pendingDeletes=(meta.pendingDeletes||[]).concat([{t:'goal',id:gid}]);
+      goalLogs(gid).forEach(function(l){meta.pendingDeletes.push({t:'log',id:l.id});});
+      saveMeta();
       goals=goals.filter(function(x){return x.id!==gid;});
       logs=logs.filter(function(l){return l.goalId!==gid;});
       saveGoals();saveLogs();refreshAll();toast('已删除');
@@ -880,6 +1076,8 @@ document.addEventListener('click',function(e){
     return;
   }
   if(act==='del-log'){
+    meta.pendingDeletes=(meta.pendingDeletes||[]).concat([{t:'log',id:t.dataset.id}]);
+    saveMeta();
     logs=logs.filter(function(l){return l.id!==t.dataset.id;});
     saveLogs();refreshAll();toast('已删除该条记录');
     return;
@@ -896,11 +1094,11 @@ document.addEventListener('click',function(e){
     if(!deadline){toast('请选择截止日');return;}
     if(editedGoalId){
       var og=goals.find(function(g){return g.id===editedGoalId;});
-      if(og){og.name=name;og.unit=unit;og.total=total;og.deadline=deadline;og.color=formColor;og.obstacle=ob;og.strategy=stg;}
+      if(og){og.name=name;og.unit=unit;og.total=total;og.deadline=deadline;og.color=formColor;og.obstacle=ob;og.strategy=stg;og.updatedAt=new Date().toISOString();}
       toast('已保存修改');
     }else{
       goals.push({id:uid(),name:name,unit:unit,total:total,deadline:deadline,color:formColor,
-        obstacle:ob,strategy:stg,example:false,createdAt:todayStr()});
+        obstacle:ob,strategy:stg,example:false,createdAt:todayStr(),updatedAt:new Date().toISOString()});
       toast('目标已创建');
     }
     saveGoals();closeModal();refreshAll();return;
@@ -958,11 +1156,43 @@ document.addEventListener('click',function(e){
     weekNotes[mon]={keep:document.getElementById('wnKeep').value.trim(),
       problem:document.getElementById('wnProblem').value.trim(),
       tryTxt:document.getElementById('wnTry').value.trim(),
-      plan:document.getElementById('wnPlan').value.trim()};
+      plan:document.getElementById('wnPlan').value.trim(),
+      updatedAt:new Date().toISOString()};
     saveNotes();toast('复盘已保存');return;
   }
   if(act==='gen-weektext'){genWeekText();return;}
   if(act==='copy-weektext'){copyReport();return;}
+  if(act==='sb-login'||act==='sb-signup'){
+    var em=document.getElementById('sbEmail').value.trim();
+    var pw=document.getElementById('sbPass').value;
+    if(!em||!pw){toast('请填写邮箱和密码');return;}
+    setSync('syncing');
+    if(act==='sb-login'){
+      sbReq('POST','/auth/v1/token?grant_type=password',{email:em,password:pw},{auth:false})
+        .then(function(j){
+          session={access_token:j.access_token,refresh_token:j.refresh_token,
+            expires_at:Math.floor(Date.now()/1000)+(j.expires_in||3600),user:j.user};
+          sbSave();toast('登录成功');refreshAll();fullSync(true);
+        })
+        .catch(function(e){setSync('off');refreshAll();toast('登录失败：'+e.msg);});
+    }else{
+      sbReq('POST','/auth/v1/signup',{email:em,password:pw},{auth:false})
+        .then(function(j){
+          if(j&&j.access_token){
+            session={access_token:j.access_token,refresh_token:j.refresh_token,
+              expires_at:Math.floor(Date.now()/1000)+(j.expires_in||3600),user:j.user};
+            sbSave();toast('注册成功');refreshAll();fullSync(true);
+          }else{
+            setSync('off');refreshAll();
+            toast('注册成功：请到邮箱点击确认链接，再回来登录');
+          }
+        })
+        .catch(function(e){setSync('off');refreshAll();toast('注册失败：'+e.msg);});
+    }
+    return;
+  }
+  if(act==='sb-logout'){session=null;sbSave();setSync('off');refreshAll();toast('已退出登录，数据仍保留在本机');return;}
+  if(act==='sb-sync'){fullSync(true);return;}
 });
 
 document.getElementById('importFile').addEventListener('change',function(){
@@ -977,7 +1207,11 @@ document.addEventListener('DOMContentLoaded',function(){
   loadAll();
   document.getElementById('logoBadge').innerHTML=ic('target',19);
   refreshAll();
+  if(session)fullSync(false);else setSync('off');
 });
+/* 聚焦/切回页面时自动拉取云端最新 */
+window.addEventListener('focus',function(){if(session)scheduleSync();});
+document.addEventListener('visibilitychange',function(){if(session&&!document.hidden)scheduleSync();});
 </script>
 </body>
 </html>
